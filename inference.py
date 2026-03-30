@@ -1,82 +1,75 @@
-"""
-inference.py  –  OpenEnv-required agent inference entry point
-=============================================================
-The OpenEnv checker looks for this file at the repository root.
-It must expose a callable `get_action(observation: dict) -> int`
-that returns one of the valid discrete actions for the environment:
-    0  – All Red  (safety pause between signal switches)
-    1  – Green North-South
-    2  – Green East-West
-"""
-
-from src.models import State
+import uvicorn
+from fastapi import FastAPI
+from pydantic import BaseModel
+from typing import Dict, Any
+from src.environment import TrafficEnv
 from src.agent import DeterministicAgent
 
-# ── Module-level singleton so the agent retains its internal timing state
-# across sequential calls in the same session.
+app = FastAPI(title="SmartTraffic OpenEnv API")
+
+# Global environment state
+_env = None
 _agent = DeterministicAgent()
 
+# ---- Pydantic Schemas ----
+class ResetRequest(BaseModel):
+    seed: int = None
 
-def get_action(observation: dict) -> int:
-    """
-    Given a raw observation dictionary (as returned by POST /reset or POST /step),
-    return an integer action index.
+class StepRequest(BaseModel):
+    action: int
 
-    Parameters
-    ----------
-    observation : dict
-        Keys match the environment's observation space defined in openenv.yaml:
-            north_queue, south_queue, east_queue, west_queue,
-            current_signal, waiting_time_total,
-            emergency_vehicle_present, time_step,
-            ns_growth, ew_growth, emergency_direction,
-            ns_wait_time, ew_wait_time
+# ---- Standard Endpoints ----
+@app.get("/")
+@app.get("/health")
+async def health():
+    return {"status": "ok", "message": "SmartTraffic OpenEnv API is running"}
 
-    Returns
-    -------
-    int  –  0 (All Red) | 1 (Green NS) | 2 (Green EW)
-    """
-    state = State(
-        north_queue=int(observation.get("north_queue", 0)),
-        south_queue=int(observation.get("south_queue", 0)),
-        east_queue=int(observation.get("east_queue", 0)),
-        west_queue=int(observation.get("west_queue", 0)),
-        current_signal=str(observation.get("current_signal", "red")),
-        waiting_time_total=float(observation.get("waiting_time_total", 0.0)),
-        emergency_vehicle_present=bool(observation.get("emergency_vehicle_present", False)),
-        time_step=int(observation.get("time_step", 0)),
-        ns_growth=float(observation.get("ns_growth", 0.0)),
-        ew_growth=float(observation.get("ew_growth", 0.0)),
-        emergency_direction=str(observation.get("emergency_direction", "none")),
-        ns_wait_time=float(observation.get("ns_wait_time", 0.0)),
-        ew_wait_time=float(observation.get("ew_wait_time", 0.0)),
-    )
-    return _agent.get_action(state)
-
-
-def reset_agent():
-    """Reset the agent's internal timing state (call when the environment resets)."""
-    global _agent
+@app.post("/reset")
+@app.post("/openenv/reset")
+async def reset_env(body: ResetRequest = None):
+    global _env, _agent
+    seed = body.seed if body and body.seed is not None else None
+    
+    # Initialize environment with OpenEnv configurations
+    _env = TrafficEnv({
+        "max_time": 50,
+        "arrival_rate": 2.0,
+        "congestion_multiplier": 1.5,
+        "emergency_prob": 0.05
+    })
     _agent = DeterministicAgent()
-
-
-# ── Allow quick local testing: python inference.py
-if __name__ == "__main__":
-    sample_obs = {
-        "north_queue": 10,
-        "south_queue": 5,
-        "east_queue": 2,
-        "west_queue": 3,
-        "current_signal": "red",
-        "waiting_time_total": 0.0,
-        "emergency_vehicle_present": False,
-        "time_step": 0,
-        "ns_growth": 0.0,
-        "ew_growth": 0.0,
-        "emergency_direction": "none",
-        "ns_wait_time": 0.0,
-        "ew_wait_time": 0.0,
+    state = _env.reset(seed=seed)
+    
+    # Extract native dictionary out of the dataclass
+    observation = state.to_dict() if hasattr(state, "to_dict") else state
+    
+    return {
+        "observation": observation,
+        "info": {"message": "Environment reset successful"}
     }
-    action = get_action(sample_obs)
-    action_names = {0: "All Red", 1: "Green NS", 2: "Green EW"}
-    print(f"Sample observation → action: {action} ({action_names[action]})")
+
+@app.post("/step")
+@app.post("/openenv/step")
+async def step_env(body: StepRequest):
+    global _env
+    if _env is None:
+        return {"error": "Environment not initialized. Call /reset first."}
+    
+    try:
+        action = int(body.action)
+    except (ValueError, TypeError):
+        action = 0  # Fallback to safe action
+        
+    result = _env.step(action)
+    
+    observation = result.state.to_dict() if hasattr(result.state, "to_dict") else result.state
+    
+    return {
+        "observation": observation,
+        "reward": float(result.reward),
+        "done": bool(result.done),
+        "info": {"message": "Step executed successfully"}
+    }
+
+if __name__ == "__main__":
+    uvicorn.run("inference:app", host="0.0.0.0", port=7860)
