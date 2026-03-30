@@ -1,3 +1,6 @@
 gradio
 matplotlib
 numpy
+fastapi
+uvicorn[standard]
+httpx
